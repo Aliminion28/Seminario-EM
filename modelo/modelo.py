@@ -1,96 +1,83 @@
 import mesa
-from .agentes import Individuo # ¡Importamos nuestra nueva clase Agente!
+import numpy as np
+from .agentes import AdminPublica, Empresa, Trabajador
 
 class ModeloAnisi(mesa.Model):
     """
-    Versión "Agentificada" del Modelo Simple de Anisi (Cap. 24).
+    Modelo ABM Completo (VERSIÓN ESTABILIZADA).
+    Reducimos la varianza para evitar resultados erráticos en la calibración.
     """
-    def __init__(self, G_a=500, z=50.0, w=10.0, z_b=5.0, 
-                 T_i_total=2000, c=0.8, l=1.0, x=1.0, 
-                 N=100, j=1.0):
+    
+    def __init__(self, 
+                 # Macro
+                 G_a=15000, t=0.22, j=1.0, 
+                 # Empresas (MENOS VARIANZA AQUÍ)
+                 z_media=55.0, z_std=2.0,    # Antes 15.0 -> Ahora 5.0
+                 w_media=16.5, w_std=1.0,    # Antes 5.0  -> Ahora 2.0
+                 # Hogares
+                 zb_media=10.0, zb_std=2.0, c_media=0.8, c_std=0.1,
+                 # Población
+                 N_trabajadores=1000, N_empresas=50, T_i_total=2000):
         
         super().__init__()
-        
-        # Guardamos los parámetros exógenos
-        self.G_a = G_a
-        self.z = z
-        self.w = w
-        self.z_b = z_b
-        self.T_i_total = T_i_total # Renombramos T_i para que sea "total"
-        self.c = c
-        self.l = l
-        self.x = x
-        self.N = N  # Número de agentes (Población)
-        self.j = j  # Jornada de trabajo de mercado (horas por agente)
-
-        # --- Cálculos globales (se hacen una vez) ---
-        
-        # L (Total horas de mercado necesarias) (Eq. 21.8)
-        self.L = self.G_a / (self.z - self.w)
-        
-        # H (Puestos de trabajo de mercado disponibles) (Basado en Cap. 24)
-        # H = L / j
-        self.H_puestos = self.L / self.j
-        
-        # C_m (Consumo deseado TOTAL) (Eq. 21.9)
-        self.C_m_total = self.c * self.T_i_total
-        
-        # C_m_agente (Consumo deseado POR AGENTE)
-        self.C_m_agente = self.C_m_total / self.N
-        
-        # L_w_p (Tiempo Máximo Disponible TOTAL) (Eq. 21.21)
-        self.L_w_p = self.T_i_total * (1 - self.c * (self.l / self.x))
-        
-        # --- Atributos de resultado (emergentes) ---
-        self.L_w = 0    # Tiempo de trabajo TOTAL (emergente)
-        self.I3 = 0     # Índice 13 (emergente)
-        
-        # --- Configuración de Agentes y Scheduler ---
+        self.T_i_total = T_i_total
         self.schedule = mesa.time.RandomActivation(self)
+        self.N = N_trabajadores
         
-        for i in range(self.N):
-            agente = Individuo(i, self)
-            self.schedule.add(agente)
+        # 1. Gobierno
+        self.admin_publica = AdminPublica("Gobierno", self, G_a, t, j)
+        self.schedule.add(self.admin_publica)
+        
+        # 2. Empresas
+        self.empresas = []
+        for i in range(N_empresas):
+            empresa = Empresa(f"Empresa_{i}", self, z_media, z_std, w_media, w_std)
+            self.empresas.append(empresa)
+            self.schedule.add(empresa)
+            
+        # 3. Trabajadores
+        self.trabajadores = []
+        for i in range(N_trabajadores):
+            trabajador = Trabajador(f"Trabajador_{i}", self, zb_media, zb_std, c_media, c_std)
+            self.trabajadores.append(trabajador)
+            self.schedule.add(trabajador)
+            
+        self.empleo_total = 0
+        self.I3_agregado = 0
 
     def step(self):
-        """
-        Ejecuta un paso de la simulación.
-        """
+        # 1. MERCADO LABORAL
+        for t in self.trabajadores: t.empleador = None
+        disponibles = self.random.sample(self.trabajadores, len(self.trabajadores))
+        indice = 0
+        self.empleo_total = 0
         
-        # --- 1. Fase de Contratación (Lógica del Modelo) ---
-        
-        # Reseteamos a todos los agentes a "desempleados"
-        for agente in self.schedule.agents:
-            agente.esta_empleado_mercado = False
-            
-        # Redondeamos H a un número entero de puestos
-        H_contratados = int(round(self.H_puestos, 0))
-        
-        # Seleccionamos N agentes al azar
-        poblacion_barajada = self.random.sample(self.schedule.agents, self.N)
-        
-        # Contratamos a los primeros H
-        for i in range(H_contratados):
-            if i < len(poblacion_barajada): # Seguridad por si H > N
-                poblacion_barajada[i].esta_empleado_mercado = True
-        
-        # --- 2. Fase de Acción (Lógica de los Agentes) ---
+        for empresa in self.empresas:
+            # Demanda
+            empresa.calcular_demanda(self.admin_publica.G_a, len(self.empresas))
+            vacantes = int(round(empresa.demanda_trabajo))
+            contratados = 0
+            # Contratación
+            while contratados < vacantes and indice < len(disponibles):
+                trabajador = disponibles[indice]
+                trabajador.empleador = empresa
+                indice += 1
+                contratados += 1
+            empresa.trabajadores_contratados = contratados
+            self.empleo_total += contratados
+
+        # 2. ACCIÓN AGENTES
         self.schedule.step()
         
-        # --- 3. Fase de Agregación (Resultados Emergentes) ---
+        # 3. CÁLCULOS MACRO
+        L_mercado_total = self.empleo_total * self.admin_publica.j
+        trabajo_extramercado_total = sum([t.L_b for t in self.trabajadores])
+        L_w_total = L_mercado_total + trabajo_extramercado_total
         
-        # Sumamos el trabajo total de TODOS los agentes
-        self.L_w = sum([a.horas_trabajo_total for a in self.schedule.agents])
+        # Tiempo disponible (Suma total)
+        L_wp_total = sum([self.T_i_total * (1 - t.c * (t.l/t.x)) for t in self.trabajadores])
         
-        # Calculamos el Índice I3 Emergente
-        if self.L_w_p > 0:
-            self.I3 = self.L_w / self.L_w_p
+        if L_wp_total > 0:
+            self.I3_agregado = L_w_total / L_wp_total
         else:
-            self.I3 = float('inf')
-
-        # --- Imprimir Resultados ---
-        print("--- PASO DEL MODELO (AGENTIFICADO) ---")
-        print(f"Puestos de Mercado (H): {self.H_puestos:.2f} (Contratados: {H_contratados})")
-        print(f"L_w (Trabajo Total Emergente): {self.L_w:.2f}")
-        print(f"L_w_p (Tiempo Máximo Disponible): {self.L_w_p:.2f}")
-        print(f"ÍNDICE I3 (Emergente): {self.I3:.4f}")
+            self.I3_agregado = float('inf')
